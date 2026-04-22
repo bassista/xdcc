@@ -45,6 +45,7 @@ Filters (applied before the selection menu):
 Selection syntax (after the list is shown):
   3        single pack
   1-5      range (packs 1 through 5)
+  1+5      count (5 consecutive packs starting from 1, i.e. 1-5)
   1,3,7    comma-separated list
   all      download everything in the list
 
@@ -210,19 +211,35 @@ func verbosityLevel(verbose, quiet int) int {
 
 // selectPacks prompts the user to select one or more packs from the results list.
 // Accepts: single number (3), range (1-5), comma list (1,3,5), or "all".
+// On invalid input, prints an error and re-prompts until valid input is given.
 func selectPacks(results []*entities.XDCCPack) ([]*entities.XDCCPack, error) {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("\nEnter selection (number, range 1-5, list 1,3,5, or 'all'): ")
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	input = strings.TrimSpace(input)
+	prompt := fmt.Sprintf("\nEnter selection (number, range 1-%d, count 1+5, list 1,3,5, or 'all'): ", len(results))
 
-	if strings.ToLower(input) == "all" {
-		return results, nil
-	}
+	for {
+		fmt.Print(prompt)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		input = strings.TrimSpace(input)
 
+		if strings.ToLower(input) == "all" {
+			return results, nil
+		}
+
+		selected, parseErr := parseSelection(input, results)
+		if parseErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", parseErr)
+			continue
+		}
+		return selected, nil
+	}
+}
+
+// parseSelection parses a selection string (e.g. "1", "1-3", "1,3,5") and
+// returns the corresponding packs. Returns an error if the input is invalid.
+func parseSelection(input string, results []*entities.XDCCPack) ([]*entities.XDCCPack, error) {
 	var selected []*entities.XDCCPack
 	seen := make(map[int]bool)
 
@@ -235,12 +252,22 @@ func selectPacks(results []*entities.XDCCPack) ([]*entities.XDCCPack, error) {
 
 	for _, part := range strings.Split(input, ",") {
 		part = strings.TrimSpace(part)
-		if strings.Contains(part, "-") {
+		if strings.Contains(part, "+") {
+			bounds := strings.SplitN(part, "+", 2)
+			start, e1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			count, e2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if e1 != nil || e2 != nil || count < 1 {
+				return nil, fmt.Errorf("invalid selection: %q", part)
+			}
+			for i := start; i < start+count; i++ {
+				addIdx(i)
+			}
+		} else if strings.Contains(part, "-") {
 			bounds := strings.SplitN(part, "-", 2)
 			start, e1 := strconv.Atoi(strings.TrimSpace(bounds[0]))
 			end, e2 := strconv.Atoi(strings.TrimSpace(bounds[1]))
 			if e1 != nil || e2 != nil {
-				return nil, fmt.Errorf("invalid selection: %s", part)
+				return nil, fmt.Errorf("invalid selection: %q", part)
 			}
 			for i := start; i <= end; i++ {
 				addIdx(i)
@@ -248,7 +275,7 @@ func selectPacks(results []*entities.XDCCPack) ([]*entities.XDCCPack, error) {
 		} else {
 			n, err := strconv.Atoi(part)
 			if err != nil {
-				return nil, fmt.Errorf("invalid selection: %s", part)
+				return nil, fmt.Errorf("invalid selection: %q", part)
 			}
 			addIdx(n)
 		}

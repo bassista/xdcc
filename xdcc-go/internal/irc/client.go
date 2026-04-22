@@ -478,7 +478,25 @@ func (c *Client) registerHandlers() {
 	c.irc.Handlers.Add(girc.NOTICE, func(client *girc.Client, e girc.Event) {
 		notice := e.Last()
 		msg := strings.ToLower(notice)
-		c.noticef("Bot notice: %s", notice)
+		// These are standard IRC server ident/hostname check messages — suppress in quiet mode.
+		quietFiltered := []string{
+			"looking up your hostname",
+			"checking ident",
+			"couldn't resolve your hostname",
+			"no ident response",
+		}
+		isQuietFiltered := false
+		for _, f := range quietFiltered {
+			if strings.Contains(msg, f) {
+				isQuietFiltered = true
+				break
+			}
+		}
+		if isQuietFiltered {
+			c.logf("Bot notice: %s", notice)
+		} else {
+			c.noticef("Bot notice: %s", notice)
+		}
 
 		alreadyReqMsgs := []string{"you already requested", "richiesto questo pack!"}
 		blockedMsgs := []string{"xdcc send negato", "numero pack errato", "invalid pack number",
