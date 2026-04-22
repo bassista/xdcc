@@ -21,7 +21,7 @@ func main() {
 		username         string
 		channelJoinDelay int
 		verbosity        int
-		quiet            bool
+		quietLevel       int
 	)
 
 	cmd := &cobra.Command{
@@ -43,7 +43,8 @@ Verbosity levels:
   (default)  show connection and download progress
   -v         also show bot notices, channel joins, WHOIS results
   -vv        full debug (DNS, DCC internals, all IRC events)
-  -q         suppress all output`,
+  -q         hide connection info; show only errors, bot notices and progress
+  -qq        suppress all output`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			message := args[0]
@@ -71,7 +72,7 @@ Verbosity levels:
 				WaitTime:         waitTime,
 				Username:         username,
 				ChannelJoinDelay: channelJoinDelay,
-				Verbosity:        verbosityLevel(verbosity, quiet),
+				Verbosity:        verbosityLevel(verbosity, quietLevel),
 			})
 			return nil
 		},
@@ -83,31 +84,35 @@ Verbosity levels:
 		"Output directory or file path (defaults to current directory with pack filename)")
 	cmd.Flags().StringVarP(&throttle, "throttle", "t", "-1",
 		"Download speed limit in bytes/s (e.g. 512K, 2M, 1G). -1 = unlimited")
-	cmd.Flags().IntVar(&connectTimeout, "connect-timeout", 120,
-		"Seconds to wait for the bot to initiate the DCC transfer (default: 120)")
-	cmd.Flags().IntVar(&stallTimeout, "stall-timeout", 60,
-		"Seconds of no transfer progress before aborting. 0 = disabled (default: 60)")
-	cmd.Flags().StringVar(&fallbackChannel, "fallback-channel", "",
+	cmd.Flags().IntVarP(&connectTimeout, "connect-timeout", "c", 120,
+		"Seconds to wait for the bot to initiate the DCC transfer")
+	cmd.Flags().IntVarP(&stallTimeout, "stall-timeout", "S", 60,
+		"Seconds of no transfer progress before aborting. 0 = disabled")
+	cmd.Flags().StringVarP(&fallbackChannel, "fallback-channel", "f", "",
 		"IRC channel to join if WHOIS returns no channels for the bot")
-	cmd.Flags().IntVar(&waitTime, "wait-time", 0,
-		"Extra seconds to wait before sending the XDCC request (default: 0)")
-	cmd.Flags().StringVar(&username, "username", "",
-		"IRC nickname to use. A random suffix is appended automatically. Default: random")
-	cmd.Flags().IntVar(&channelJoinDelay, "channel-join-delay", -1,
-		"Seconds to wait after connecting before sending WHOIS. -1 = random 5-10s (default: -1)")
+	cmd.Flags().IntVarP(&waitTime, "wait-time", "w", 0,
+		"Extra seconds to wait before sending the XDCC request")
+	cmd.Flags().StringVarP(&username, "username", "u", "",
+		"IRC nickname to use (a random suffix is always appended; default: random)")
+	cmd.Flags().IntVarP(&channelJoinDelay, "channel-join-delay", "d", -1,
+		"Seconds to wait after connecting before sending WHOIS (-1 = random 5-10s)")
 	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v shows bot notices, -vv shows full debug info")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress all output including progress")
+	cmd.Flags().CountVarP(&quietLevel, "quiet", "q", "Reduce output: -q hides connection info (keeps errors/notices/progress), -qq suppresses all output")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-// verbosityLevel converts count+quiet flags to verbosity int.
-// quiet => -1, default => 0, -v => 1, -vv => 2
-func verbosityLevel(count int, quiet bool) int {
-	if quiet {
+// verbosityLevel maps verbose count and quiet count to a verbosity int.
+// -qq (quiet>=2) => -2 (suppress all), -q (quiet=1) => -1 (suppress info, keep errors/notices/progress)
+// default => 0, -v => 1, -vv => 2
+func verbosityLevel(verbose, quiet int) int {
+	if quiet >= 2 {
+		return -2
+	}
+	if quiet >= 1 {
 		return -1
 	}
-	return count
+	return verbose
 }

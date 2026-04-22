@@ -73,8 +73,8 @@ Verbosity levels:
 		},
 	}
 
-	cmd.Flags().StringVar(&engineName, "search-engine", "xdcc-eu",
-		"Search engine to use: nibl, xdcc-eu, ixirc, subsplease (default: xdcc-eu). Can also be passed as second positional argument")
+	cmd.Flags().StringVarP(&engineName, "search-engine", "e", "xdcc-eu",
+		"Search engine to use: nibl, xdcc-eu, ixirc, subsplease. Can also be passed as second positional argument")
 	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v shows search engine debug info")
 
 	if err := cmd.Execute(); err != nil {

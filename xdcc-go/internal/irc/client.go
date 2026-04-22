@@ -478,7 +478,7 @@ func (c *Client) registerHandlers() {
 	c.irc.Handlers.Add(girc.NOTICE, func(client *girc.Client, e girc.Event) {
 		notice := e.Last()
 		msg := strings.ToLower(notice)
-		c.logf("Bot notice: %s", notice)
+		c.noticef("Bot notice: %s", notice)
 
 		alreadyReqMsgs := []string{"you already requested", "richiesto questo pack!"}
 		blockedMsgs := []string{"xdcc send negato", "numero pack errato", "invalid pack number",
@@ -505,12 +505,12 @@ func (c *Client) registerHandlers() {
 	})
 
 	c.irc.Handlers.Add(girc.ERR_NOSUCHNICK, func(client *girc.Client, e girc.Event) {
-		c.infof("Bot '%s' not found on server", c.currentPack().Bot)
+		c.noticef("Bot '%s' not found on server", c.currentPack().Bot)
 		c.finishWithError(ErrBotNotFound)
 	})
 
 	c.irc.Handlers.Add(girc.ERROR, func(client *girc.Client, e girc.Event) {
-		c.infof("IRC error: %s", e.Last())
+		c.noticef("IRC error: %s", e.Last())
 		c.finishWithError(ErrUnrecoverable)
 	})
 }
@@ -588,7 +588,7 @@ func (c *Client) handleDCCSend(client *girc.Client, parts []string, sourceHost s
 		c.logf("Existing file: %s, remote: %s",
 			entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 		if pos >= filesize {
-			c.infof("File already fully downloaded (local: %s >= remote: %s), skipping",
+			c.noticef("File already fully downloaded (local: %s >= remote: %s), skipping",
 				entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 			c.finishWithError(ErrAlreadyDownloaded)
 			return
@@ -828,7 +828,7 @@ func (c *Client) stallWatcher() {
 			}
 			idle := time.Since(time.Unix(0, last))
 			if idle >= stall {
-				c.infof("Transfer stalled for %s (no data received), aborting",
+				c.noticef("Transfer stalled for %s (no data received), aborting",
 					idle.Round(time.Second))
 				c.mu.Lock()
 				if c.dccConn != nil {
@@ -882,13 +882,13 @@ func (c *Client) finishWithError(err error) {
 func (c *Client) checkServerReachable(host string) error {
 	addrs, err := net.LookupHost(host)
 	if err != nil {
-		c.infof("DNS resolution failed for %s: %v", host, err)
+		c.noticef("DNS resolution failed for %s: %v", host, err)
 		return fmt.Errorf("%w: cannot resolve %s: %v", ErrServerUnreachable, host, err)
 	}
 	c.debugf("DNS resolved %s → %v", host, addrs)
 	for _, addr := range addrs {
 		if addr == "0.0.0.0" || addr == "::" {
-			c.infof("Server %s resolves to %s — DNS-blocked or server is down", host, addr)
+			c.noticef("Server %s resolves to %s — DNS-blocked or server is down", host, addr)
 			return fmt.Errorf("%w: %s resolves to %s (DNS-blocked or server down)",
 				ErrServerUnreachable, host, addr)
 		}
@@ -918,6 +918,14 @@ func isConnectError(err error) bool {
 
 func (c *Client) infof(format string, args ...interface{}) {
 	if c.verbosity >= 0 {
+		log.Printf("[xdcc] "+format, args...)
+	}
+}
+
+// noticef prints at verbosity >= -1 (quiet and above).
+// Use for errors, bot messages, and status that matter even in quiet mode.
+func (c *Client) noticef(format string, args ...interface{}) {
+	if c.verbosity >= -1 {
 		log.Printf("[xdcc] "+format, args...)
 	}
 }
