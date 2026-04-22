@@ -2,6 +2,7 @@ package entities
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +22,41 @@ func NewIrcServer(address string) IrcServer {
 // NewIrcServerWithPort creates a new IrcServer with a specific port.
 func NewIrcServerWithPort(address string, port int) IrcServer {
 	return IrcServer{Address: address, Port: port}
+}
+
+// ParseIrcServer parses a server string which may be "host", "host:port",
+// "ip", or "ip:port". If no port is specified, defaults to 6667.
+func ParseIrcServer(s string) IrcServer {
+	// net.SplitHostPort handles IPv6 [::1]:port syntax too
+	host, portStr, err := splitHostPort(s)
+	if err != nil || portStr == "" {
+		return IrcServer{Address: s, Port: 6667}
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return IrcServer{Address: s, Port: 6667}
+	}
+	return IrcServer{Address: host, Port: port}
+}
+
+// splitHostPort splits "host:port" but also accepts bare "host" (no port).
+func splitHostPort(s string) (host, port string, err error) {
+	// If it contains "[" it's IPv6 — always use net.SplitHostPort
+	if strings.Contains(s, "[") {
+		host, port, err = net.SplitHostPort(s)
+		return
+	}
+	// Count colons: 0 or 1 → hostname or host:port; >1 → bare IPv6
+	colons := strings.Count(s, ":")
+	if colons == 0 {
+		return s, "", nil
+	}
+	if colons == 1 {
+		host, port, err = net.SplitHostPort(s)
+		return
+	}
+	// Multiple colons → bare IPv6 address (no port)
+	return s, "", nil
 }
 
 // XDCCPack models an XDCC pack to be downloaded from an IRC bot.
@@ -199,15 +235,20 @@ func ParseXDCCMessage(msg, directory, server string) ([]*XDCCPack, error) {
 }
 
 // resolveServer returns the appropriate IrcServer for the given bot name.
-// Applies known bot-prefix → server overrides.
+// Applies known bot-prefix → server overrides only when the default server
+// is irc.rizon.net (i.e. no explicit --server was provided by the user).
 func resolveServer(bot, defaultServer string) IrcServer {
+	if defaultServer != "irc.rizon.net" && defaultServer != "" {
+		// User explicitly set a server — honour it regardless of bot prefix
+		return ParseIrcServer(defaultServer)
+	}
 	switch {
 	case strings.HasPrefix(bot, "TLT"):
 		return NewIrcServer("irc.williamgattone.it")
 	case strings.HasPrefix(bot, "WeC"):
 		return NewIrcServer("irc.explosionirc.net")
 	default:
-		return NewIrcServer(defaultServer)
+		return ParseIrcServer(defaultServer)
 	}
 }
 

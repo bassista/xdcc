@@ -2,6 +2,7 @@
 package downloader
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -51,32 +52,36 @@ func downloadPack(pack *entities.XDCCPack, opts Options, retryCount int) {
 		return
 	}
 
-	switch err {
-	case xdccirc.ErrAlreadyDownloaded:
+	switch {
+	case errors.Is(err, xdccirc.ErrAlreadyDownloaded):
 		fmt.Printf("File already downloaded (skipping): %s\n", pack.Filename)
-	case xdccirc.ErrBotDenied:
+	case errors.Is(err, xdccirc.ErrBotDenied):
 		notice := client.LastBotNotice()
 		if notice != "" {
 			fmt.Printf("Bot denied XDCC request: %s\n", notice)
 		} else {
 			fmt.Printf("Bot denied XDCC request for: %s\n", pack.Filename)
 		}
-	case xdccirc.ErrPackAlreadyReq:
+	case errors.Is(err, xdccirc.ErrPackAlreadyReq):
 		fmt.Println("Pack already requested. Waiting 60 seconds before retrying...")
 		time.Sleep(60 * time.Second)
 		downloadPack(pack, opts, retryCount+1)
-	case xdccirc.ErrBotNotFound:
+	case errors.Is(err, xdccirc.ErrBotNotFound):
 		fmt.Printf("Bot %s not found on server %s\n", pack.Bot, pack.Server.Address)
-	case xdccirc.ErrTimeout:
+	case errors.Is(err, xdccirc.ErrServerUnreachable):
+		// Don't retry — the server is down/blocked
+		fmt.Printf("Server unreachable (%s): %v\n", pack.Server.Address, err)
+		fmt.Println("Tip: use --server to override the IRC server address.")
+	case errors.Is(err, xdccirc.ErrTimeout):
 		if retryCount < 3 {
 			fmt.Println("Retrying...")
 			downloadPack(pack, opts, retryCount+1)
 		} else {
 			fmt.Printf("Giving up on pack %d after timeout\n", pack.PackNumber)
 		}
-	case xdccirc.ErrUnrecoverable:
+	case errors.Is(err, xdccirc.ErrUnrecoverable):
 		fmt.Println("Unrecoverable error (IP banned?). Aborting.")
-	case xdccirc.ErrDownloadFailed:
+	case errors.Is(err, xdccirc.ErrDownloadFailed):
 		fmt.Printf("Download of %s failed. Retrying...\n", pack.Filename)
 		if retryCount < 3 {
 			downloadPack(pack, opts, retryCount+1)

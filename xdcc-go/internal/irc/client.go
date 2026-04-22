@@ -31,14 +31,24 @@ func (e *XDCCDownloadError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Kind, e.Message)
 }
 
+// Is allows errors.Is() to match by Kind, even when wrapped.
+func (e *XDCCDownloadError) Is(target error) bool {
+	t, ok := target.(*XDCCDownloadError)
+	if !ok {
+		return false
+	}
+	return e.Kind == t.Kind
+}
+
 var (
-	ErrTimeout           = &XDCCDownloadError{Kind: "timeout", Message: "download timed out"}
-	ErrBotNotFound       = &XDCCDownloadError{Kind: "bot_not_found", Message: "bot does not exist on server"}
-	ErrPackAlreadyReq    = &XDCCDownloadError{Kind: "pack_already_requested", Message: "pack already requested, try again later"}
-	ErrAlreadyDownloaded = &XDCCDownloadError{Kind: "already_downloaded", Message: "file already downloaded"}
-	ErrBotDenied         = &XDCCDownloadError{Kind: "bot_denied", Message: "bot denied the XDCC request"}
-	ErrUnrecoverable     = &XDCCDownloadError{Kind: "unrecoverable", Message: "unrecoverable error (IP banned?)"}
-	ErrDownloadFailed    = &XDCCDownloadError{Kind: "download_failed", Message: "download did not complete"}
+	ErrTimeout             = &XDCCDownloadError{Kind: "timeout", Message: "download timed out"}
+	ErrBotNotFound         = &XDCCDownloadError{Kind: "bot_not_found", Message: "bot does not exist on server"}
+	ErrPackAlreadyReq      = &XDCCDownloadError{Kind: "pack_already_requested", Message: "pack already requested, try again later"}
+	ErrAlreadyDownloaded   = &XDCCDownloadError{Kind: "already_downloaded", Message: "file already downloaded"}
+	ErrBotDenied           = &XDCCDownloadError{Kind: "bot_denied", Message: "bot denied the XDCC request"}
+	ErrServerUnreachable   = &XDCCDownloadError{Kind: "server_unreachable", Message: "IRC server is unreachable"}
+	ErrUnrecoverable       = &XDCCDownloadError{Kind: "unrecoverable", Message: "unrecoverable error (IP banned?)"}
+	ErrDownloadFailed      = &XDCCDownloadError{Kind: "download_failed", Message: "download did not complete"}
 )
 
 // DownloadOptions configures a download session.
@@ -152,6 +162,11 @@ func (c *Client) Download() (string, error) {
 	c.infof("Connecting to %s:%d as '%s'", c.pack.Server.Address, c.pack.Server.Port, nick)
 	c.logf("Pack: #%d from bot '%s'", c.pack.PackNumber, c.pack.Bot)
 
+	// Pre-check: resolve the server hostname to catch DNS blocks (e.g. 0.0.0.0)
+	if err := c.checkServerReachable(); err != nil {
+		return "", err
+	}
+
 	c.irc = girc.New(girc.Config{
 		Server:      c.pack.Server.Address,
 		Port:        c.pack.Server.Port,
@@ -173,7 +188,7 @@ func (c *Client) Download() (string, error) {
 	// Phase 1: wait for the DCC transfer to start (connect timeout covers
 	// IRC connect + channel join + bot response time).
 	connectTimeout := time.Duration(c.opts.ConnectTimeout+c.opts.WaitTime+c.opts.ChannelJoinDelay+30) * time.Second
-	c.logf("Connect timeout: %s", connectTimeout)
+	c.logf("Waiting up to %s for bot to initiate DCC transfer", connectTimeout)
 	select {
 	case <-c.downloadStarted:
 		// Transfer started — move to phase 2
@@ -183,7 +198,13 @@ func (c *Client) Download() (string, error) {
 		goto done
 	case err := <-errCh:
 		if err != nil && c.downloadError == nil {
-			c.downloadError = err
+			c.infof("IRC connection error: %v", err)
+			// Classify connection-level failures as server unreachable (don't retry)
+			if isConnectError(err) {
+				c.downloadError = fmt.Errorf("%w: %v", ErrServerUnreachable, err)
+			} else {
+				c.downloadError = err
+			}
 		}
 		goto done
 	case <-time.After(connectTimeout):
@@ -206,6 +227,7 @@ func (c *Client) Download() (string, error) {
 		// normal completion or error during transfer
 	case err := <-errCh:
 		if err != nil && c.downloadError == nil {
+			c.logf("IRC error during transfer: %v", err)
 			c.downloadError = err
 		}
 	}
@@ -281,15 +303,21 @@ func (c *Client) registerHandlers() {
 
 	// CTCP DCC handler (DCC SEND / DCC ACCEPT for resume)
 	c.irc.CTCP.Set("DCC", func(client *girc.Client, ctcp girc.CTCPEvent) {
-		c.handleDCC(client, ctcp.Text)
+		// Extract source host for passive DCC (IP=0 in message)
+		sourceHost := ""
+		if ctcp.Source != nil {
+			sourceHost = ctcp.Source.Host
+		}
+		c.handleDCC(client, ctcp.Text, sourceHost)
 	})
 
 	// Handle NOTICE from bot (pack already requested, slots busy, denied, etc.)
 	c.irc.Handlers.Add(girc.NOTICE, func(client *girc.Client, e girc.Event) {
 		notice := e.Last()
 		msg := strings.ToLower(notice)
-		// Always show NOTICE messages from the bot
-		c.infof("Bot notice: %s", notice)
+		// Show bot NOTICEs only in verbose mode; error cases are reported via
+		// the typed error (ErrPackAlreadyReq / ErrBotDenied) in the downloader.
+		c.logf("Bot notice: %s", notice)
 
 		alreadyReqMsgs := []string{"you already requested", "richiesto questo pack!"}
 		blockedMsgs := []string{"xdcc send negato", "numero pack errato", "invalid pack number", "gli slots sono occupati", "denied"}
@@ -340,7 +368,7 @@ func (c *Client) sendXDCCRequest(client *girc.Client) {
 	client.Cmd.Message(c.pack.Bot, msg)
 }
 
-func (c *Client) handleDCC(client *girc.Client, text string) {
+func (c *Client) handleDCC(client *girc.Client, text string, sourceHost string) {
 	// text is like: SEND filename ip port filesize
 	//            or: ACCEPT filename port position
 	parts := splitDCC(text)
@@ -351,7 +379,7 @@ func (c *Client) handleDCC(client *girc.Client, text string) {
 	cmd := strings.ToUpper(parts[0])
 	switch cmd {
 	case "SEND":
-		c.handleDCCSend(client, parts)
+		c.handleDCCSend(client, parts, sourceHost)
 	case "ACCEPT":
 		c.handleDCCAccept(parts)
 	default:
@@ -359,7 +387,7 @@ func (c *Client) handleDCC(client *girc.Client, text string) {
 	}
 }
 
-func (c *Client) handleDCCSend(client *girc.Client, parts []string) {
+func (c *Client) handleDCCSend(client *girc.Client, parts []string, sourceHost string) {
 	if len(parts) < 5 {
 		c.logf("Malformed DCC SEND: %v", parts)
 		return
@@ -369,7 +397,19 @@ func (c *Client) handleDCCSend(client *girc.Client, parts []string) {
 	port := parts[3]
 	sizeStr := parts[4]
 
-	peerAddr := ipNumToQuad(ipNum) + ":" + port
+	// Passive DCC: bot sends IP=0, meaning use its IRC source address
+	peerIP := ipNumToQuad(ipNum)
+	if peerIP == "0.0.0.0" {
+		if sourceHost != "" {
+			c.logf("Passive DCC: using source host %s instead of 0.0.0.0", sourceHost)
+			peerIP = sourceHost
+		} else {
+			// Fall back to the server address as a best-effort
+			peerIP = c.pack.Server.Address
+			c.logf("Passive DCC with unknown source host, falling back to %s", peerIP)
+		}
+	}
+	peerAddr := peerIP + ":" + port
 	filesize := parseI64(sizeStr)
 
 	c.pack.SetFilename(filename, false)
@@ -596,11 +636,31 @@ func (c *Client) progressPrinter() {
 			if total > 0 {
 				pct = float64(prog) / float64(total) * 100
 			}
-			fmt.Printf("\r  %.1f%% [%s / %s] %.1f KB/s    ",
+
+			eta := ""
+			if speed > 0 && total > prog {
+				remaining := time.Duration(float64(total-prog)/speed) * time.Second
+				if remaining < 90*time.Second {
+					eta = fmt.Sprintf(" remaining: %ds", int(remaining.Seconds()))
+				} else {
+					m := int(remaining.Minutes())
+					s := int(remaining.Seconds()) % 60
+					eta = fmt.Sprintf(" remaining: %dm %ds", m, s)
+				}
+			}
+
+			speedKB := speed / 1024
+			speedStr := fmt.Sprintf("%.1f KB/s", speedKB)
+			if speedKB >= 1024 {
+				speedStr = fmt.Sprintf("%.2f MB/s", speedKB/1024)
+			}
+
+			fmt.Printf("\r  %.1f%% [%s / %s] %s%s    ",
 				pct,
 				entities.HumanReadableBytes(prog),
 				entities.HumanReadableBytes(total),
-				speed/1024)
+				speedStr,
+				eta)
 
 			c.mu.Lock()
 			dl := c.downloading
@@ -645,7 +705,6 @@ func (c *Client) stallWatcher() {
 				continue
 			}
 			idle := time.Since(time.Unix(0, last))
-			c.logf("Stall check: idle for %s (limit %s)", idle.Round(time.Second), stall)
 			if idle >= stall {
 				c.infof("Transfer stalled for %s (no data received), aborting", idle.Round(time.Second))
 				c.finishWithError(ErrTimeout)
@@ -688,6 +747,48 @@ func (c *Client) LastBotNotice() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lastBotNotice
+}
+
+// checkServerReachable resolves the IRC server hostname and checks for
+// known-bad addresses (0.0.0.0, loopback) that indicate DNS blocking.
+func (c *Client) checkServerReachable() error {
+	host := c.pack.Server.Address
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		c.infof("DNS resolution failed for %s: %v", host, err)
+		return fmt.Errorf("%w: cannot resolve %s: %v", ErrServerUnreachable, host, err)
+	}
+	c.logf("DNS resolved %s → %v", host, addrs)
+	for _, addr := range addrs {
+		if addr == "0.0.0.0" || addr == "::" {
+			c.infof("Server %s resolves to %s — DNS-blocked or server is down", host, addr)
+			return fmt.Errorf("%w: %s resolves to %s (DNS-blocked or server down)", ErrServerUnreachable, host, addr)
+		}
+	}
+	return nil
+}
+
+// isConnectError returns true if err is a TCP-level connection failure
+// (refused, timeout, no route) rather than a mid-session protocol error.
+func isConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	keywords := []string{
+		"connection refused",
+		"no route to host",
+		"network is unreachable",
+		"i/o timeout",
+		"no such host",
+		"dial ",
+	}
+	for _, k := range keywords {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) logf(format string, args ...interface{}) {
