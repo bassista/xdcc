@@ -1,12 +1,12 @@
 // Package irc implements the XDCC IRC client using the girc library.
-// It handles connecting to an IRC server, performing WHOIS to find the
-// bot's channel, joining that channel, sending the XDCC request, and
-// managing the resulting DCC file transfer.
+// A single Client can download multiple packs sequentially on the same IRC
+// connection, rejoining channels only when needed.
 package irc
 
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -20,6 +20,10 @@ import (
 	"github.com/lrstanley/girc"
 	"xdcc-go/internal/entities"
 )
+
+// ---------------------------------------------------------------------------
+// Error types
+// ---------------------------------------------------------------------------
 
 // XDCCDownloadError represents a typed error from the XDCC download process.
 type XDCCDownloadError struct {
@@ -41,15 +45,19 @@ func (e *XDCCDownloadError) Is(target error) bool {
 }
 
 var (
-	ErrTimeout             = &XDCCDownloadError{Kind: "timeout", Message: "download timed out"}
-	ErrBotNotFound         = &XDCCDownloadError{Kind: "bot_not_found", Message: "bot does not exist on server"}
-	ErrPackAlreadyReq      = &XDCCDownloadError{Kind: "pack_already_requested", Message: "pack already requested, try again later"}
-	ErrAlreadyDownloaded   = &XDCCDownloadError{Kind: "already_downloaded", Message: "file already downloaded"}
-	ErrBotDenied           = &XDCCDownloadError{Kind: "bot_denied", Message: "bot denied the XDCC request"}
-	ErrServerUnreachable   = &XDCCDownloadError{Kind: "server_unreachable", Message: "IRC server is unreachable"}
-	ErrUnrecoverable       = &XDCCDownloadError{Kind: "unrecoverable", Message: "unrecoverable error (IP banned?)"}
-	ErrDownloadFailed      = &XDCCDownloadError{Kind: "download_failed", Message: "download did not complete"}
+	ErrTimeout           = &XDCCDownloadError{Kind: "timeout", Message: "download timed out"}
+	ErrBotNotFound       = &XDCCDownloadError{Kind: "bot_not_found", Message: "bot does not exist on server"}
+	ErrPackAlreadyReq    = &XDCCDownloadError{Kind: "pack_already_requested", Message: "pack already requested, try again later"}
+	ErrAlreadyDownloaded = &XDCCDownloadError{Kind: "already_downloaded", Message: "file already downloaded"}
+	ErrBotDenied         = &XDCCDownloadError{Kind: "bot_denied", Message: "bot denied the XDCC request"}
+	ErrServerUnreachable = &XDCCDownloadError{Kind: "server_unreachable", Message: "IRC server is unreachable"}
+	ErrUnrecoverable     = &XDCCDownloadError{Kind: "unrecoverable", Message: "unrecoverable error (IP banned?)"}
+	ErrDownloadFailed    = &XDCCDownloadError{Kind: "download_failed", Message: "download did not complete"}
 )
+
+// ---------------------------------------------------------------------------
+// Options and result types
+// ---------------------------------------------------------------------------
 
 // DownloadOptions configures a download session.
 type DownloadOptions struct {
@@ -59,54 +67,75 @@ type DownloadOptions struct {
 	ThrottleBytes    int64  // bytes/sec limit, -1 = unlimited
 	WaitTime         int    // seconds to wait before sending XDCC request
 	Username         string // IRC nick to use; empty = random
-	ChannelJoinDelay int    // seconds to wait after connecting before joining channels; -1 = random 5-10
+	ChannelJoinDelay int    // seconds to wait after connecting before WHOIS; -1 = random 5-10
 }
 
-// Client manages a single XDCC pack download.
+// PackResult holds the outcome of a single pack download.
+type PackResult struct {
+	FilePath      string // non-empty on success
+	Error         error
+	LastBotNotice string // last NOTICE from bot (useful when Error != nil)
+}
+
+// ---------------------------------------------------------------------------
+// Client struct
+// ---------------------------------------------------------------------------
+
+// Client manages the download of one or more XDCC packs on a single IRC
+// connection. Packs on the same server are downloaded without disconnecting;
+// channels already joined are not rejoined.
 type Client struct {
-	pack      *entities.XDCCPack
+	packs     []*entities.XDCCPack
 	opts      DownloadOptions
-	irc       *girc.Client
-	verbosity int // 0=normal, 1=verbose (-v), 2=debug (-vv)
+	verbosity int // 0=normal, 1=verbose, 2=debug, -1=quiet
 
-	// DCC state
-	mu           sync.Mutex
-	peerAddr     string // stored on DCC SEND, used again on DCC ACCEPT
-	dccConn      net.Conn
-	dccFile      *os.File
-	progress     int64
-	filesize     int64
-	dccTimestamp time.Time
-	downloading  bool
+	// IRC connection (reset on reconnect)
+	irc            *girc.Client
+	ircErrCh       chan error     // receives error from irc.Connect() goroutine
+	connectedCh    chan struct{}  // closed on CONNECTED event
+	joinedChannels map[string]bool // channels joined in this connection (cleared on reconnect)
+	connectTime    time.Time
 
-	// ACK queue
-	ackQueue chan []byte
+	// Current pack index (set before each pack download)
+	packIdxVal atomic.Int32
 
-	// flow control
-	messageSent        atomic.Bool
-	whoisJoinedChannel atomic.Bool // set when JOIN was sent from WHOIS reply
-	downloadDone       chan struct{}
-	downloadStarted    chan struct{} // closed when DCC TCP connection is established
+	// Per-pack state (reset via resetForPack between packs)
+	mu                 sync.Mutex
+	peerAddr           string   // stored on DCC SEND, reused on DCC ACCEPT
+	dccConn            net.Conn
+	dccFile            *os.File
+	progress           int64
+	filesize           int64
+	dccTimestamp       time.Time
+	downloading        bool
 	downloadError      error
-	connectTime        time.Time
-	closeOnce          sync.Once // ensures downloadDone and ackQueue are closed only once
-	startOnce          sync.Once // ensures downloadStarted is closed only once
+	lastBotNotice      string
+	downStartTime      time.Time
 
-	// last bot notice message (for error reporting)
-	lastBotNotice string
+	ackQueue        chan []byte
+	downloadDone    chan struct{} // closed when pack finishes (success or error)
+	downloadStarted chan struct{} // closed when DCC TCP connection is established
+	closeOnce       sync.Once
+	startOnce       sync.Once
+
+	// WHOIS flow control (per-pack, reset in resetForPack)
+	messageSent        atomic.Bool
+	whoisFoundChannels atomic.Bool // WHOIS found at least one channel
+	needsJoin          atomic.Bool // we sent a JOIN and must wait for confirmation
 
 	// stall detection: unix nanoseconds of last received byte
 	lastActivity atomic.Int64
-
-	// timing
-	downStartTime time.Time
 }
 
-// NewClient creates a new XDCC download client.
-// verbosity: 0=normal, 1=verbose (-v), 2=debug (-vv), -1=quiet (suppress infof too).
-func NewClient(pack *entities.XDCCPack, opts DownloadOptions, verbosity int) *Client {
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+
+// NewClient creates a new XDCC Client that will download all packs in order.
+// packs must all belong to the same IRC server.
+// verbosity: -1=quiet, 0=normal, 1=verbose (-v), 2=debug (-vv).
+func NewClient(packs []*entities.XDCCPack, opts DownloadOptions, verbosity int) *Client {
 	if opts.ChannelJoinDelay < 0 {
-		// random 5-10 seconds
 		n, _ := rand.Int(rand.Reader, big.NewInt(6))
 		opts.ChannelJoinDelay = int(n.Int64()) + 5
 	}
@@ -117,156 +146,275 @@ func NewClient(pack *entities.XDCCPack, opts DownloadOptions, verbosity int) *Cl
 		opts.StallTimeout = 0
 	}
 	return &Client{
-		pack:            pack,
-		opts:            opts,
-		verbosity:       verbosity,
-		downloadDone:    make(chan struct{}),
-		downloadStarted: make(chan struct{}),
-		ackQueue:        make(chan []byte, 256),
+		packs:     packs,
+		opts:      opts,
+		verbosity: verbosity,
 	}
 }
 
-// randomUsername generates a random IRC nickname.
-func randomUsername() string {
-	firstNames := []string{"Alice", "Bob", "Charlie", "Dave", "Eve", "Frank", "Grace", "Hank"}
-	lastNames := []string{"Smith", "Jones", "Brown", "Wilson", "Taylor", "Davis", "Clark", "Lewis"}
-	n1, _ := rand.Int(rand.Reader, big.NewInt(int64(len(firstNames))))
-	n2, _ := rand.Int(rand.Reader, big.NewInt(int64(len(lastNames))))
-	num, _ := rand.Int(rand.Reader, big.NewInt(90))
-	suffix := randomSuffix(3)
-	return fmt.Sprintf("%s%s%d%s",
-		firstNames[n1.Int64()],
-		lastNames[n2.Int64()],
-		num.Int64()+10,
-		suffix)
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-func randomSuffix(n int) string {
-	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
-		b[i] = chars[idx.Int64()]
+// DownloadAll downloads all packs sequentially, reusing the IRC connection
+// for packs on the same server. Returns one PackResult per pack.
+func (c *Client) DownloadAll() []PackResult {
+	results := make([]PackResult, len(c.packs))
+
+	if err := c.connect(); err != nil {
+		for i := range results {
+			results[i].Error = err
+		}
+		return results
 	}
-	return string(b)
+
+	for i := range c.packs {
+		results[i] = c.downloadPackAtIndex(i, 0)
+		// Fatal errors: propagate to all remaining packs
+		if results[i].Error != nil {
+			if errors.Is(results[i].Error, ErrServerUnreachable) ||
+				errors.Is(results[i].Error, ErrUnrecoverable) {
+				for j := i + 1; j < len(results); j++ {
+					results[j].Error = results[i].Error
+				}
+				break
+			}
+		}
+	}
+
+	c.irc.Close()
+	// Drain ircErrCh so the goroutine can exit
+	select {
+	case <-c.ircErrCh:
+	case <-time.After(5 * time.Second):
+	}
+	return results
 }
 
-// Download connects to IRC and downloads the pack.
-// Returns the path to the downloaded file, or an error.
-func (c *Client) Download() (string, error) {
+// LastBotNotice returns the last NOTICE received from the bot for the
+// current pack. Safe to call after DownloadAll returns.
+func (c *Client) LastBotNotice() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastBotNotice
+}
+
+// ---------------------------------------------------------------------------
+// Connection management
+// ---------------------------------------------------------------------------
+
+func (c *Client) connect() error {
+	server := c.packs[0].Server
+	if err := c.checkServerReachable(server.Address); err != nil {
+		return err
+	}
+
 	nick := c.opts.Username
 	if nick == "" {
 		nick = randomUsername()
 	} else {
 		nick = nick + randomSuffix(3)
 	}
+	c.infof("Connecting to %s:%d as '%s'", server.Address, server.Port, nick)
 
-	c.infof("Connecting to %s:%d as '%s'", c.pack.Server.Address, c.pack.Server.Port, nick)
-	c.debugf("Pack: #%d from bot '%s'", c.pack.PackNumber, c.pack.Bot)
-
-	// Pre-check: resolve the server hostname to catch DNS blocks (e.g. 0.0.0.0)
-	if err := c.checkServerReachable(); err != nil {
-		return "", err
-	}
+	c.connectedCh = make(chan struct{})
+	c.joinedChannels = make(map[string]bool)
+	c.ircErrCh = make(chan error, 1)
 
 	c.irc = girc.New(girc.Config{
-		Server:      c.pack.Server.Address,
-		Port:        c.pack.Server.Port,
+		Server:      server.Address,
+		Port:        server.Port,
 		Nick:        nick,
 		User:        nick,
 		Name:        nick,
 		PingDelay:   30 * time.Second,
 		PingTimeout: 60 * time.Second,
 	})
-
 	c.registerHandlers()
+	go func() { c.ircErrCh <- c.irc.Connect() }()
 
-	// Run IRC event loop in background
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- c.irc.Connect()
-	}()
+	timeout := time.Duration(c.opts.ConnectTimeout+30) * time.Second
+	select {
+	case <-c.connectedCh:
+		return nil
+	case err := <-c.ircErrCh:
+		if err != nil {
+			if isConnectError(err) {
+				return fmt.Errorf("%w: %v", ErrServerUnreachable, err)
+			}
+			return err
+		}
+		return fmt.Errorf("IRC connection closed before CONNECTED event")
+	case <-time.After(timeout):
+		c.irc.Close()
+		return ErrTimeout
+	}
+}
 
-	// Phase 1: wait for the DCC transfer to start (connect timeout covers
-	// IRC connect + channel join + bot response time).
-	connectTimeout := time.Duration(c.opts.ConnectTimeout+c.opts.WaitTime+c.opts.ChannelJoinDelay+30) * time.Second
+func (c *Client) reconnect() error {
+	c.infof("Reconnecting to IRC...")
+	c.irc.Close()
+	// Drain ircErrCh (may have been consumed already; best-effort)
+	select {
+	case <-c.ircErrCh:
+	case <-time.After(3 * time.Second):
+	}
+	return c.connect()
+}
+
+// ---------------------------------------------------------------------------
+// Per-pack download
+// ---------------------------------------------------------------------------
+
+func (c *Client) currentPack() *entities.XDCCPack {
+	return c.packs[c.packIdxVal.Load()]
+}
+
+func (c *Client) resetForPack() {
+	c.mu.Lock()
+	c.peerAddr = ""
+	if c.dccConn != nil {
+		c.dccConn.Close()
+		c.dccConn = nil
+	}
+	if c.dccFile != nil {
+		c.dccFile.Close()
+		c.dccFile = nil
+	}
+	c.progress = 0
+	c.filesize = 0
+	c.downloading = false
+	c.downloadError = nil
+	c.lastBotNotice = ""
+	c.downStartTime = time.Time{}
+	c.mu.Unlock()
+
+	c.messageSent.Store(false)
+	c.whoisFoundChannels.Store(false)
+	c.needsJoin.Store(false)
+	c.lastActivity.Store(0)
+	c.downloadDone = make(chan struct{})
+	c.downloadStarted = make(chan struct{})
+	c.ackQueue = make(chan []byte, 256)
+	c.closeOnce = sync.Once{}
+	c.startOnce = sync.Once{}
+}
+
+func (c *Client) downloadPackAtIndex(idx int, retryCount int) PackResult {
+	if retryCount > 3 {
+		return PackResult{Error: fmt.Errorf("giving up on pack %d after 3 retries",
+			c.packs[idx].PackNumber)}
+	}
+
+	c.packIdxVal.Store(int32(idx))
+	c.resetForPack()
+	pack := c.currentPack()
+
+	c.debugf("Pack: #%d from bot '%s'", pack.PackNumber, pack.Bot)
+
+	// Channel-join delay only on first connection (not between packs)
+	if idx == 0 {
+		c.debugf("Waiting %ds before WHOIS (channel join delay)", c.opts.ChannelJoinDelay)
+		time.Sleep(time.Duration(c.opts.ChannelJoinDelay) * time.Second)
+	}
+
+	c.debugf("Sending WHOIS for bot '%s'", pack.Bot)
+	c.irc.Cmd.Whois(pack.Bot)
+
+	err := c.waitForCurrentPack()
+	if err == nil {
+		return PackResult{FilePath: pack.GetFilepath()}
+	}
+
+	switch {
+	case errors.Is(err, ErrPackAlreadyReq):
+		fmt.Println("Pack already requested. Waiting 60 seconds before retrying...")
+		time.Sleep(60 * time.Second)
+		return c.downloadPackAtIndex(idx, retryCount+1)
+
+	case errors.Is(err, ErrTimeout), errors.Is(err, ErrDownloadFailed):
+		fmt.Printf("Retrying pack #%d (attempt %d/3)...\n", pack.PackNumber, retryCount+1)
+		if err2 := c.reconnect(); err2 != nil {
+			return PackResult{Error: err2}
+		}
+		return c.downloadPackAtIndex(idx, retryCount+1)
+	}
+
+	c.mu.Lock()
+	notice := c.lastBotNotice
+	c.mu.Unlock()
+	return PackResult{Error: err, LastBotNotice: notice}
+}
+
+func (c *Client) waitForCurrentPack() error {
+	// Phase 1: wait for DCC transfer to start.
+	// Covers: WHOIS response + channel join + bot response + WaitTime.
+	connectTimeout := time.Duration(c.opts.ConnectTimeout+c.opts.WaitTime+30) * time.Second
 	c.debugf("Waiting up to %s for bot to initiate DCC transfer", connectTimeout)
+
 	select {
 	case <-c.downloadStarted:
 		c.debugf("Transfer started, switching to stall detection")
 	case <-c.downloadDone:
-		// Completed or errored before transfer started
-		goto done
-	case err := <-errCh:
+		return c.downloadError
+	case err := <-c.ircErrCh:
+		// IRC connection died before transfer started; treat as timeout so
+		// downloadPackAtIndex will reconnect and retry.
 		if err != nil && c.downloadError == nil {
-			c.infof("IRC connection error: %v", err)
-			// Classify connection-level failures as server unreachable (don't retry)
 			if isConnectError(err) {
-				c.downloadError = fmt.Errorf("%w: %v", ErrServerUnreachable, err)
-			} else {
-				c.downloadError = err
+				return fmt.Errorf("%w: %v", ErrServerUnreachable, err)
 			}
+			return ErrTimeout
 		}
-		goto done
+		return c.downloadError
 	case <-time.After(connectTimeout):
-		c.irc.Close()
-		if c.downloadError == nil {
-			c.infof("Connect timeout (%s): bot did not initiate DCC transfer in time", connectTimeout)
-			c.downloadError = ErrTimeout
-		}
-		goto done
+		c.finishWithError(ErrTimeout)
+		return ErrTimeout
 	}
 
-	// Phase 2: transfer is in progress.
-	// Stall detection is handled by stallWatcher() goroutine (if StallTimeout > 0).
-	// Wait for completion or IRC error.
+	// Phase 2: DCC transfer is a direct TCP connection — it can survive
+	// IRC disconnect. Just wait for completion.
 	if c.opts.StallTimeout > 0 {
 		go c.stallWatcher()
 	}
-	select {
-	case <-c.downloadDone:
-		// normal completion or error during transfer
-	case err := <-errCh:
-		if err != nil && c.downloadError == nil {
-			c.logf("IRC error during transfer: %v", err)
-			c.downloadError = err
-		}
-	}
-
-done:
-	if c.downloadError != nil {
-		return "", c.downloadError
-	}
-	return c.pack.GetFilepath(), nil
+	<-c.downloadDone
+	return c.downloadError
 }
 
+// ---------------------------------------------------------------------------
+// IRC handlers
+// ---------------------------------------------------------------------------
+
 func (c *Client) registerHandlers() {
-	// After successful connection
 	c.irc.Handlers.Add(girc.CONNECTED, func(client *girc.Client, e girc.Event) {
 		c.connectTime = time.Now()
 		c.infof("Connected to server")
-		c.debugf("Waiting %ds before WHOIS (channel join delay)", c.opts.ChannelJoinDelay)
-		time.Sleep(time.Duration(c.opts.ChannelJoinDelay) * time.Second)
-		c.debugf("Sending WHOIS for bot '%s'", c.pack.Bot)
-		client.Cmd.Whois(c.pack.Bot)
-		go c.timeoutWatcher(client)
+		close(c.connectedCh)
 	})
 
-	// End of WHOIS — only send request if no channels were found from WHOIS.
-	// If channels were found, we already sent JOIN and will send the request on the JOIN event.
+	// End of WHOIS: decide whether to send XDCC now or wait for JOIN.
 	c.irc.Handlers.Add(girc.RPL_ENDOFWHOIS, func(client *girc.Client, e girc.Event) {
 		c.debugf("End of WHOIS")
-		if c.messageSent.Load() || c.whoisJoinedChannel.Load() {
-			// Either already sent, or a JOIN is pending — do nothing here
+		if c.messageSent.Load() {
 			return
 		}
-		// No channels found at all
+		if c.needsJoin.Load() {
+			// We sent a JOIN; wait for the JOIN event to trigger XDCC.
+			return
+		}
+		if c.whoisFoundChannels.Load() {
+			// All channels were already joined — send XDCC directly.
+			c.sendXDCCRequest(client)
+			return
+		}
+		// No channels found in WHOIS at all.
 		if c.opts.FallbackChannel != "" {
 			ch := c.opts.FallbackChannel
 			if !strings.HasPrefix(ch, "#") {
 				ch = "#" + ch
 			}
 			c.debugf("No channels from WHOIS; joining fallback channel %s", ch)
+			c.needsJoin.Store(true)
 			client.Cmd.Join(ch)
 		} else {
 			c.debugf("No channels from WHOIS and no fallback; sending XDCC request directly")
@@ -274,37 +422,50 @@ func (c *Client) registerHandlers() {
 		}
 	})
 
-	// WHOIS channels info - join each channel the bot is in
+	// WHOIS channels: join only channels we have not yet joined.
 	c.irc.Handlers.Add(girc.RPL_WHOISCHANNELS, func(client *girc.Client, e girc.Event) {
 		if len(e.Params) < 2 {
 			return
 		}
 		c.logf("WHOIS channels: %s", e.Params[len(e.Params)-1])
 		rawChannels := e.Params[len(e.Params)-1]
-		parts := strings.Fields(rawChannels)
-		for _, part := range parts {
+		for _, part := range strings.Fields(rawChannels) {
 			part = strings.TrimLeft(part, "@+%&~")
-			if strings.HasPrefix(part, "#") {
+			if !strings.HasPrefix(part, "#") {
+				continue
+			}
+			ch := strings.ToLower(part)
+			c.whoisFoundChannels.Store(true)
+			c.mu.Lock()
+			alreadyIn := c.joinedChannels[ch]
+			c.mu.Unlock()
+			if alreadyIn {
+				c.logf("Already in channel %s, skipping JOIN", part)
+			} else {
 				c.logf("Joining channel %s", part)
-				c.whoisJoinedChannel.Store(true)
+				c.needsJoin.Store(true)
 				time.Sleep(time.Duration(1+randN(2)) * time.Second)
 				client.Cmd.Join(part)
 			}
 		}
 	})
 
-	// On JOIN - send XDCC request after joining
+	// JOIN: record membership, send XDCC if pending.
 	c.irc.Handlers.Add(girc.JOIN, func(client *girc.Client, e girc.Event) {
 		if e.Source == nil || !strings.EqualFold(e.Source.Name, client.GetNick()) {
 			return
 		}
+		ch := strings.ToLower(e.Params[0])
+		c.mu.Lock()
+		c.joinedChannels[ch] = true
+		c.mu.Unlock()
 		c.debugf("Joined channel: %s", e.Params[0])
 		if !c.messageSent.Load() {
 			c.sendXDCCRequest(client)
 		}
 	})
 
-	// CTCP DCC handler (DCC SEND / DCC ACCEPT for resume)
+	// CTCP DCC handler (DCC SEND / DCC ACCEPT for resume).
 	c.irc.CTCP.Set("DCC", func(client *girc.Client, ctcp girc.CTCPEvent) {
 		sourceHost := ""
 		if ctcp.Source != nil {
@@ -313,14 +474,15 @@ func (c *Client) registerHandlers() {
 		c.handleDCC(client, ctcp.Text, sourceHost)
 	})
 
-	// Handle NOTICE from bot (pack already requested, slots busy, denied, etc.)
+	// NOTICE from bot.
 	c.irc.Handlers.Add(girc.NOTICE, func(client *girc.Client, e girc.Event) {
 		notice := e.Last()
 		msg := strings.ToLower(notice)
 		c.logf("Bot notice: %s", notice)
 
 		alreadyReqMsgs := []string{"you already requested", "richiesto questo pack!"}
-		blockedMsgs := []string{"xdcc send negato", "numero pack errato", "invalid pack number", "gli slots sono occupati", "denied"}
+		blockedMsgs := []string{"xdcc send negato", "numero pack errato", "invalid pack number",
+			"gli slots sono occupati", "denied"}
 
 		for _, s := range alreadyReqMsgs {
 			if strings.Contains(msg, s) {
@@ -342,13 +504,11 @@ func (c *Client) registerHandlers() {
 		}
 	})
 
-	// Bot not found on server
 	c.irc.Handlers.Add(girc.ERR_NOSUCHNICK, func(client *girc.Client, e girc.Event) {
-		c.infof("Bot '%s' not found on server", c.pack.Bot)
+		c.infof("Bot '%s' not found on server", c.currentPack().Bot)
 		c.finishWithError(ErrBotNotFound)
 	})
 
-	// IRC error (ban, etc.)
 	c.irc.Handlers.Add(girc.ERROR, func(client *girc.Client, e girc.Event) {
 		c.infof("IRC error: %s", e.Last())
 		c.finishWithError(ErrUnrecoverable)
@@ -357,33 +517,34 @@ func (c *Client) registerHandlers() {
 
 func (c *Client) sendXDCCRequest(client *girc.Client) {
 	if c.messageSent.Swap(true) {
-		return // already sent
+		return
 	}
 	if c.opts.WaitTime > 0 {
 		c.logf("Waiting %ds before sending XDCC request", c.opts.WaitTime)
 		time.Sleep(time.Duration(c.opts.WaitTime) * time.Second)
 	}
-	msg := c.pack.GetRequestMessage(false)
-	c.debugf("Sending XDCC request: /msg %s %s", c.pack.Bot, msg)
-	client.Cmd.Message(c.pack.Bot, msg)
+	pack := c.currentPack()
+	msg := pack.GetRequestMessage(false)
+	c.debugf("Sending XDCC request: /msg %s %s", pack.Bot, msg)
+	client.Cmd.Message(pack.Bot, msg)
 }
 
+// ---------------------------------------------------------------------------
+// DCC handling
+// ---------------------------------------------------------------------------
+
 func (c *Client) handleDCC(client *girc.Client, text string, sourceHost string) {
-	// text is like: SEND filename ip port filesize
-	//            or: ACCEPT filename port position
 	parts := splitDCC(text)
 	if len(parts) == 0 {
 		return
 	}
-
-	cmd := strings.ToUpper(parts[0])
-	switch cmd {
+	switch strings.ToUpper(parts[0]) {
 	case "SEND":
 		c.handleDCCSend(client, parts, sourceHost)
 	case "ACCEPT":
 		c.handleDCCAccept(parts)
 	default:
-		c.logf("Unknown DCC command: %s", cmd)
+		c.logf("Unknown DCC command: %s", parts[0])
 	}
 }
 
@@ -397,54 +558,50 @@ func (c *Client) handleDCCSend(client *girc.Client, parts []string, sourceHost s
 	port := parts[3]
 	sizeStr := parts[4]
 
-	// Passive DCC: bot sends IP=0, meaning use its IRC source address
 	peerIP := ipNumToQuad(ipNum)
 	if peerIP == "0.0.0.0" {
 		if sourceHost != "" {
 			c.logf("Passive DCC: using source host %s instead of 0.0.0.0", sourceHost)
 			peerIP = sourceHost
 		} else {
-			// Fall back to the server address as a best-effort
-			peerIP = c.pack.Server.Address
+			peerIP = c.currentPack().Server.Address
 			c.logf("Passive DCC with unknown source host, falling back to %s", peerIP)
 		}
 	}
 	peerAddr := peerIP + ":" + port
 	filesize := parseI64(sizeStr)
 
-	c.pack.SetFilename(filename, false)
+	pack := c.currentPack()
+	pack.SetFilename(filename, false)
 	c.filesize = filesize
 
-	// Store peer address for potential DCC RESUME → ACCEPT flow
 	c.mu.Lock()
 	c.peerAddr = peerAddr
 	c.mu.Unlock()
 
 	c.debugf("DCC SEND: file=%s addr=%s size=%s", filename, peerAddr, entities.HumanReadableBytes(filesize))
 
-	// Check for resume
-	existingPath := c.pack.GetFilepath()
+	existingPath := pack.GetFilepath()
 	c.debugf("Checking for existing file at: %s", existingPath)
 	if fi, err := os.Stat(existingPath); err == nil {
 		pos := fi.Size()
-		c.logf("Existing file size: %s, DCC file size: %s", entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
+		c.logf("Existing file: %s, remote: %s",
+			entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 		if pos >= filesize {
 			c.infof("File already fully downloaded (local: %s >= remote: %s), skipping",
 				entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 			c.finishWithError(ErrAlreadyDownloaded)
 			return
 		}
-		// Request resume
 		c.progress = pos
 		resumeParam := fmt.Sprintf("\"%s\" %s %d", filename, port, pos)
-		c.debugf("Resuming download from %s / %s", entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
+		c.debugf("Resuming download from %s / %s",
+			entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 		c.logf("Sending DCC RESUME: %s", resumeParam)
-		// Send CTCP DCC RESUME to the bot
-		client.Cmd.SendCTCP(c.pack.Bot, "DCC", "RESUME "+resumeParam)
+		client.Cmd.SendCTCP(pack.Bot, "DCC", "RESUME "+resumeParam)
 		return
 	}
 
-	// Start fresh download
 	c.startDownload(peerAddr, false)
 }
 
@@ -452,30 +609,19 @@ func (c *Client) handleDCCAccept(parts []string) {
 	if len(parts) < 4 {
 		return
 	}
-	port := parts[2]
-	// position := parts[3] // already set in progress
-
-	// Find peer address from the previous SEND (reuse it)
-	// We need to reconstruct - store it from SEND
-	// For simplicity, we re-use the stored address
 	c.debugf("DCC ACCEPT: resuming download")
-	_ = port
-	// Start appending
 	c.startDownloadAppend()
 }
 
-// We need to store the peer address between SEND and ACCEPT
-// Add a field to Client for this purpose
 func (c *Client) startDownload(addr string, appendMode bool) {
 	flag := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	if appendMode {
 		flag = os.O_APPEND | os.O_WRONLY
 	}
 
-	path := c.pack.GetFilepath()
+	path := c.currentPack().GetFilepath()
 	f, err := os.OpenFile(path, flag, 0644)
 	if err != nil {
-		c.logf("Cannot open file: %v", err)
 		c.finishWithError(fmt.Errorf("cannot open file: %w", err))
 		return
 	}
@@ -483,7 +629,6 @@ func (c *Client) startDownload(addr string, appendMode bool) {
 	conn, err := net.DialTimeout("tcp", addr, 30*time.Second)
 	if err != nil {
 		f.Close()
-		c.logf("DCC connection failed: %v", err)
 		c.finishWithError(fmt.Errorf("DCC connection failed: %w", err))
 		return
 	}
@@ -499,7 +644,6 @@ func (c *Client) startDownload(addr string, appendMode bool) {
 	c.debugf("Starting download (append=%v) to %s", appendMode, path)
 	c.infof("Downloading %s → %s", entities.HumanReadableBytes(c.filesize), path)
 
-	// Signal that transfer has started
 	c.startOnce.Do(func() { close(c.downloadStarted) })
 	c.lastActivity.Store(time.Now().UnixNano())
 
@@ -509,7 +653,6 @@ func (c *Client) startDownload(addr string, appendMode bool) {
 }
 
 func (c *Client) startDownloadAppend() {
-	// Called on DCC ACCEPT; peer address was stored earlier
 	c.mu.Lock()
 	peerAddr := c.peerAddr
 	c.mu.Unlock()
@@ -552,7 +695,6 @@ func (c *Client) receiveData() {
 			atomic.AddInt64(&c.progress, int64(n))
 			c.lastActivity.Store(time.Now().UnixNano())
 
-			// Throttle
 			if c.opts.ThrottleBytes > 0 {
 				c.mu.Lock()
 				delta := time.Since(c.dccTimestamp).Seconds()
@@ -564,8 +706,6 @@ func (c *Client) receiveData() {
 					time.Sleep(time.Duration(sleepTime * float64(time.Second)))
 				}
 			}
-
-			// Enqueue ACK
 			c.enqueueACK()
 		}
 		if err != nil {
@@ -574,7 +714,6 @@ func (c *Client) receiveData() {
 	}
 }
 
-// ackSender sends ACKs from the queue.
 func (c *Client) ackSender() {
 	for ack := range c.ackQueue {
 		c.mu.Lock()
@@ -588,7 +727,6 @@ func (c *Client) ackSender() {
 	}
 }
 
-// enqueueACK encodes the current progress as a big-endian uint32 (or uint64) ACK.
 func (c *Client) enqueueACK() {
 	prog := atomic.LoadInt64(&c.progress)
 	var ack []byte
@@ -602,11 +740,9 @@ func (c *Client) enqueueACK() {
 	select {
 	case c.ackQueue <- ack:
 	default:
-		// drop if queue full
 	}
 }
 
-// progressPrinter prints download progress periodically.
 func (c *Client) progressPrinter() {
 	c.mu.Lock()
 	for !c.downloading {
@@ -643,9 +779,8 @@ func (c *Client) progressPrinter() {
 				if remaining < 90*time.Second {
 					eta = fmt.Sprintf(" remaining: %ds", int(remaining.Seconds()))
 				} else {
-					m := int(remaining.Minutes())
-					s := int(remaining.Seconds()) % 60
-					eta = fmt.Sprintf(" remaining: %dm %ds", m, s)
+					eta = fmt.Sprintf(" remaining: %dm %ds",
+						int(remaining.Minutes()), int(remaining.Seconds())%60)
 				}
 			}
 
@@ -676,21 +811,8 @@ func (c *Client) progressPrinter() {
 	}
 }
 
-// timeoutWatcher watches for timeout if the XDCC message was never sent.
-func (c *Client) timeoutWatcher(client *girc.Client) {
-	for !c.messageSent.Load() {
-		time.Sleep(1 * time.Second)
-		if time.Since(c.connectTime) > time.Duration(c.opts.ConnectTimeout+c.opts.WaitTime)*time.Second {
-			c.logf("Timeout: XDCC request never sent")
-			c.finishWithError(ErrTimeout)
-			client.Close()
-			return
-		}
-	}
-}
-
-// stallWatcher monitors transfer progress and closes the connection if no bytes
-// are received for StallTimeout seconds. Runs only during an active transfer.
+// stallWatcher monitors transfer progress. On stall it closes the DCC
+// connection (not the IRC connection) so the download can be retried.
 func (c *Client) stallWatcher() {
 	stall := time.Duration(c.opts.StallTimeout) * time.Second
 	ticker := time.NewTicker(5 * time.Second)
@@ -706,53 +828,58 @@ func (c *Client) stallWatcher() {
 			}
 			idle := time.Since(time.Unix(0, last))
 			if idle >= stall {
-				c.infof("Transfer stalled for %s (no data received), aborting", idle.Round(time.Second))
+				c.infof("Transfer stalled for %s (no data received), aborting",
+					idle.Round(time.Second))
+				c.mu.Lock()
+				if c.dccConn != nil {
+					c.dccConn.Close()
+				}
+				c.mu.Unlock()
 				c.finishWithError(ErrTimeout)
-				c.irc.Close()
 				return
 			}
 		}
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Finish helpers
+// ---------------------------------------------------------------------------
+
+// finishSuccess records a successful download. Does NOT close the IRC
+// connection so subsequent packs can reuse it.
 func (c *Client) finishSuccess() {
-	elapsed := time.Since(c.connectTime)
+	elapsed := time.Since(c.downStartTime)
 	speed := float64(c.filesize) / elapsed.Seconds() / 1024
 	fmt.Printf("File %s downloaded successfully in %s at %.1f KB/s\n",
-		c.pack.Filename,
+		c.currentPack().Filename,
 		formatDuration(elapsed),
 		speed)
-	c.irc.Close()
 	c.closeOnce.Do(func() {
 		close(c.downloadDone)
 		close(c.ackQueue)
 	})
 }
 
+// finishWithError records a download error. Does NOT close the IRC
+// connection so the session can retry or continue with the next pack.
 func (c *Client) finishWithError(err error) {
 	c.mu.Lock()
 	if c.downloadError == nil {
 		c.downloadError = err
 	}
 	c.mu.Unlock()
-	c.irc.Close()
 	c.closeOnce.Do(func() {
 		close(c.downloadDone)
 		close(c.ackQueue)
 	})
 }
 
-// LastBotNotice returns the last NOTICE message received from the bot.
-func (c *Client) LastBotNotice() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastBotNotice
-}
+// ---------------------------------------------------------------------------
+// Server reachability
+// ---------------------------------------------------------------------------
 
-// checkServerReachable resolves the IRC server hostname and checks for
-// known-bad addresses (0.0.0.0, loopback) that indicate DNS blocking.
-func (c *Client) checkServerReachable() error {
-	host := c.pack.Server.Address
+func (c *Client) checkServerReachable(host string) error {
 	addrs, err := net.LookupHost(host)
 	if err != nil {
 		c.infof("DNS resolution failed for %s: %v", host, err)
@@ -762,28 +889,22 @@ func (c *Client) checkServerReachable() error {
 	for _, addr := range addrs {
 		if addr == "0.0.0.0" || addr == "::" {
 			c.infof("Server %s resolves to %s — DNS-blocked or server is down", host, addr)
-			return fmt.Errorf("%w: %s resolves to %s (DNS-blocked or server down)", ErrServerUnreachable, host, addr)
+			return fmt.Errorf("%w: %s resolves to %s (DNS-blocked or server down)",
+				ErrServerUnreachable, host, addr)
 		}
 	}
 	return nil
 }
 
-// isConnectError returns true if err is a TCP-level connection failure
-// (refused, timeout, no route) rather than a mid-session protocol error.
 func isConnectError(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	keywords := []string{
-		"connection refused",
-		"no route to host",
-		"network is unreachable",
-		"i/o timeout",
-		"no such host",
-		"dial ",
-	}
-	for _, k := range keywords {
+	for _, k := range []string{
+		"connection refused", "no route to host", "network is unreachable",
+		"i/o timeout", "no such host", "dial ",
+	} {
 		if strings.Contains(s, k) {
 			return true
 		}
@@ -791,28 +912,52 @@ func isConnectError(err error) bool {
 	return false
 }
 
-// infof always prints (verbosity >= 0).
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
 func (c *Client) infof(format string, args ...interface{}) {
 	if c.verbosity >= 0 {
 		log.Printf("[xdcc] "+format, args...)
 	}
 }
 
-// logf prints at verbosity >= 1 (-v).
 func (c *Client) logf(format string, args ...interface{}) {
 	if c.verbosity >= 1 {
 		log.Printf("[xdcc] "+format, args...)
 	}
 }
 
-// debugf prints at verbosity >= 2 (-vv).
 func (c *Client) debugf(format string, args ...interface{}) {
 	if c.verbosity >= 2 {
 		log.Printf("[xdcc] "+format, args...)
 	}
 }
 
-// formatDuration formats a duration as "Xs" or "X.Xm".
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+func randomUsername() string {
+	firstNames := []string{"Alice", "Bob", "Charlie", "Dave", "Eve", "Frank", "Grace", "Hank"}
+	lastNames := []string{"Smith", "Jones", "Brown", "Wilson", "Taylor", "Davis", "Clark", "Lewis"}
+	n1, _ := rand.Int(rand.Reader, big.NewInt(int64(len(firstNames))))
+	n2, _ := rand.Int(rand.Reader, big.NewInt(int64(len(lastNames))))
+	num, _ := rand.Int(rand.Reader, big.NewInt(90))
+	return fmt.Sprintf("%s%s%d%s",
+		firstNames[n1.Int64()], lastNames[n2.Int64()], num.Int64()+10, randomSuffix(3))
+}
+
+func randomSuffix(n int) string {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
+		b[i] = chars[idx.Int64()]
+	}
+	return string(b)
+}
+
 func formatDuration(d time.Duration) string {
 	if d < 90*time.Second {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
@@ -820,7 +965,6 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.1fm", d.Minutes())
 }
 
-// ipNumToQuad converts a numeric IP string to dotted-quad notation.
 func ipNumToQuad(ipNum string) string {
 	n := parseU32(ipNum)
 	return fmt.Sprintf("%d.%d.%d.%d",
