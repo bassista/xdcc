@@ -1,0 +1,75 @@
+#!/usr/bin/env python
+"""LICENSE
+Copyright 2016 Hermann Krumrey <hermann@krumreyh.com>
+
+This file is part of xdcc-dl.
+
+xdcc-dl is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+xdcc-dl is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with xdcc-dl.  If not, see <http://www.gnu.org/licenses/>.
+LICENSE"""
+
+import os
+import logging
+import argparse
+from puffotter.init import cli_start, argparse_add_verbosity
+from xdcc_dl import sentry_dsn
+from xdcc_dl.xdcc import download_packs
+from xdcc_dl.helper import prepare_packs, add_xdcc_argparse_arguments
+from xdcc_dl.entities import XDCCPack
+from xdcc_dl.xdcc.exceptions import DownloadIncomplete
+
+
+def main(args: argparse.Namespace, logger: logging.Logger):
+    """
+    Starts the main method of the program
+    :param args: The command line arguments
+    :param logger: The logger to use
+    :return: None
+    """
+    try:
+        packs = XDCCPack.from_xdcc_message(
+            args.message, os.getcwd(), args.server
+        )
+        prepare_packs(packs, args.out)
+
+        download_packs(
+            packs,
+            timeout=args.timeout,
+            fallback_channel=args.fallback_channel,
+            throttle=args.throttle,
+            wait_time=args.wait_time,
+            username=args.username,
+            channel_join_delay=args.channel_join_delay
+        )
+
+    except DownloadIncomplete:
+        logger.warning("Download incomplete.")
+        raise KeyboardInterrupt()
+    except ValueError:
+        print("Invalid throttle value {}".format(args.throttle))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("message",
+                        help="An XDCC Message. Supports ranges (1-100), "
+                             "ranges with steps (1-100;2) as well as "
+                             "comma-separated packs: (1,2,3).")
+    add_xdcc_argparse_arguments(parser)
+    argparse_add_verbosity(parser)
+    cli_start(
+        main, parser,
+        sentry_dsn=None,
+        package_name="xdcc-dl",
+        exit_msg="Ciao"
+    )

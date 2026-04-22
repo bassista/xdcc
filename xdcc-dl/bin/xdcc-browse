@@ -1,0 +1,92 @@
+#!/usr/bin/env python
+"""LICENSE
+Copyright 2016 Hermann Krumrey <hermann@krumreyh.com>
+
+This file is part of xdcc-dl.
+
+xdcc-dl is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+xdcc-dl is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with xdcc-dl.  If not, see <http://www.gnu.org/licenses/>.
+LICENSE"""
+
+import logging
+import argparse
+from typing import List
+from requests.exceptions import ConnectionError
+from puffotter.init import cli_start, argparse_add_verbosity
+from puffotter.prompt import selection_prompt
+from xdcc_dl import sentry_dsn
+from xdcc_dl.xdcc.exceptions import DownloadIncomplete
+from xdcc_dl.helper import prepare_packs, add_xdcc_argparse_arguments
+from xdcc_dl.entities import XDCCPack
+from xdcc_dl.xdcc import download_packs
+from xdcc_dl.pack_search.SearchEngine import SearchEngineType
+
+
+def main(args: argparse.Namespace, logger: logging.Logger):
+    """
+    Conducts a XDCC pack search with the option to immediately download any
+    found packs
+    :param args: The command line arguments
+    :param logger: The logger to use
+    :return: None
+    """
+    try:
+        search_engine = SearchEngineType.resolve(args.search_engine)
+
+        results = search_engine.search(args.search_term)
+
+        if len(results) == 0:
+           raise DownloadIncomplete
+
+        # noinspection PyTypeChecker
+        packs = selection_prompt(results)  # type: List[XDCCPack]
+        prepare_packs(packs, args.out)
+
+        for pack in packs:
+            logger.info("Downloading pack {}".format(pack))
+
+        try:
+            download_packs(
+                packs,
+                timeout=args.timeout,
+                fallback_channel=args.fallback_channel,
+                throttle=args.throttle,
+                wait_time=args.wait_time,
+                username=args.username,
+                channel_join_delay=args.channel_join_delay
+            )
+        except ValueError:
+            print("Invalid throttle value {}".format(args.throttle))
+
+    except ConnectionError:
+        print("Connection Error, could not conduct search")
+    except DownloadIncomplete:
+        logger.warning("Download incomplete.")
+        raise KeyboardInterrupt()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("search_term", help="The term to search for")
+    parser.add_argument("--search-engine",
+                        default=SearchEngineType.NIBL.name.lower(),
+                        choices=SearchEngineType.choices(True),
+                        help="The Search Engine to use")
+    add_xdcc_argparse_arguments(parser)
+    argparse_add_verbosity(parser)
+    cli_start(
+        main, parser,
+        sentry_dsn=None,
+        package_name="xdcc-dl",
+        exit_msg="Ciao"
+    )

@@ -1,0 +1,90 @@
+V 5.2.1:
+  - Fixed nibl search engine with 0 search results
+V 5.2.0:
+  - Made XDCC Client slightly more reliable
+  - Fixed nibl search engine
+  - Better error handling for subsplease engine (which is currently broken due to CloudFlare DDoS protection)
+V 5.1.0:
+  - iXIRC search now uses the API, courtesy of Jean Wicht
+V 5.0.0:
+  - Replaced horriblesubs search engine with subsplease
+  - Fixed issues with the bot being banned due to bot detection mechanisms
+  - Avoid overlap if terminal window is too small during download
+  - Added wait_time parameter
+  - Added file size display to xdcc-search and xdcc-browse
+  - Added xdcc.eu search engine
+  - Added --username and --channel
+V 4.0.0:
+  - Went over to completely rely on python's built-in logging
+  - Throttle value is now passed as parameter
+  - Logging to files now active by default
+V 3.3.0:
+  - Added download speed progress
+  - Fixed slow download speeds
+  - Fixed crashes when running without a tty
+  - Added --silent flag
+  - Added --fallback-channel option
+V 3.2.0:
+  - Added notice that python 2 is no longer supported
+  - Fixed program hanging when no channels are joined
+  - Added timeout to xdcc-dl
+  - Improved xdcc-search to include server configuration
+V 3.1.2:
+  - Integrated sentry
+  - Integrated mypy static type checking
+V 3.1.1:
+  - Use docker in CI
+V 3.1.0:
+  - Implemented xdcc-browse
+  - Handles failed requests for packs better
+  - Fixed horriblesubs search for pack names containing commas
+V 3.0.3:
+  - Imported legacy projects
+V 3.0.2:
+  - Minor project structure fixes
+V 3.0.1:
+  - Restructured project to make use of theimproved ci-scripts
+V 3.0.0:
+  - Redid the layer structure to be contained in a single, more concise class
+  - Integrated Progstats URL
+V 2.1.0:
+  - Renamed repository to xdcc-dl
+  - Moved project metadata to root __init__.py file
+  - Removed sentry/raven integration
+  - Removed intel_haruhichan parser
+V 2.0.0:
+  - Fixed nibl.co.uk parser
+  - Breaking change: metadata module now completely redone
+V 1.1.0-1.1.3:
+  - Fixed release script typo
+  - Fixed release uploading
+  - Fixed build process
+  - Made message argument positional
+V 1.0.1:
+  - Added typing module to dependencies
+V 1.0.0:
+  - Implemented a TUI to offer a terminal-based alternative to the GUI
+  - Fixed an issue with channels not being found using whois queries with specific bots
+  - Added automatic logging of bots that don't provide complete whois information
+  - Made sure that connections are closed if the program exits
+V 0.5.0:
+  - Implemented a GUI for searching and downloading XDCC Packs
+V 0.4.0:
+  - Extensive independent unit testing
+  - Added test coverage report
+  - Directly implemented random username generation in the User class
+  - Implemented pack skipping
+  - Implemented Horriblesubs Pack Searcher using cfscrape
+V 0.3.0:
+  - Enhanced the Progress structure with callbacks and calculations
+  - Fixed order issues
+  - Fixed script files not running correctly due to missing shebang
+  - Created Windows builds
+V 0.2.0:
+  - More robust handling of unforeseen events
+  - Unit Testing
+  - XDCC Pack searchers
+  - Server-independent consecutive downloading
+V 0.1.0:
+  - Simple Command Line script that downloads XDCC Packs based on XDCC messages
+  - Defined XDCC Downloader layer structure

@@ -1,0 +1,127 @@
+V 0.17.3:
+  - Fixed human readable byte conversion for negative numbers
+V 0.17.2:
+  - Added touch function
+V 0.17.1:
+  - Fixed byte string count conversion on decimal numbers
+V 0.17.0:
+  - Removed flask and created new project 'jerrycan'
+V 0.16.0:
+  - Made ReCaptcha also check on localhost and 127.0.0.1
+V 0.15.2:
+  - Added extra jinja variables to test framework
+V 0.15.1:
+  - Handles SMTP Authentication errors gracefully
+V 0.15.0:
+  - Now strips spaces from usernames during registration
+  - Allows for more custom jinja variables
+V 0.14.4:
+  - Only log ActionExceptions when they are code >= 500
+V 0.14.3:
+  - Fixed flask model JSON behaviour when dealing with lists
+V 0.14.2:
+  - Fixed endless recursion issues in json representation
+  - Fixed missing error logging in API
+V 0.14.1:
+  - Fixed issue with postgres variables
+V 0.14.0:
+  - Made __json__ method for ModelMixins automated
+V 0.13.0:
+  - Adjusted postgres variable names
+V 0.12.1:
+  - Changed file loggers to time-based rollover loggers
+V 0.12.0:
+  - Added type annotations to db model attributes
+  - Made db model relations bi-directional
+  - Fixed sentry logging behaviour for flask
+  - Adjusted parameters provided to registration and password forgot emails
+  - Now fails gracefully if database connection can't be established
+  - Improved logging configuration for flask
+V 0.11.0:
+  - Log traceback in errors in flask framework
+V 0.10.2:
+  - Added more postgres variables to required variables for better backups
+V 0.10.1:
+  - Don't activate telegram when testing
+V 0.10.0:
+  - Added specification for environment variables in flask framework
+  - Added telegram bot capabilities to flask framework
+  - Added URL path capabilities to flask framework
+  - Added environment variable dumping capabilities to flask framework
+V 0.9.6:
+  - Added domain name to flask config
+V 0.9.5:
+  - Enhanced flask logging
+V 0.9.4:
+  - Fixed enum handling in ModelMixin repr method
+V 0.9.3:
+  - Fixed flask API issues
+V 0.9.2:
+  - Added ways to add more variables to template rendering for default routes
+  - Fixed loading extra config data
+  - Fixed issues with flask while testing due to import side effects
+V 0.9.1:
+  - Fixed errors when missing recaptcha string in form
+V 0.9.0:
+  - Added flask module
+V 0.8.0:
+  - Added env module
+V 0.7.0:
+  - Added json module
+  - Added imap and smtp modules
+  - Added recaptcha module
+V 0.6.0:
+  - Fixed some prompting issues
+  - Added requests and subprocess modules
+V 0.5.1:
+  - Added get_ext function
+  - Added choices option to prompt function
+V 0.5.0:
+  - Added capability to log to files easily
+  - Added silent option
+  - Added ColorLogger
+  - Fixed selection prompt ranges
+V 0.4.6:
+  - Added option to remove trailing zeroes from human_readable_bytes function
+V 0.4.5:
+  - Added function to convert an amount of bytes into a human-readable string
+V 0.4.4:
+  - Added default parameter to commalist prompt
+V 0.4.3:
+  - Added create_file function
+V 0.4.2:
+  - Fixed issues with comma list prompts giving empty strings
+V 0.4.1:
+  - Added more prompt functions
+V 0.4.0:
+  - Added graphql class
+  - Added option for logging to cli_start
+  - Added pprint functionality
+  - Added prompt functions
+  - Added function to sanitize file names
+V 0.3.1:
+  - Added puffotter.os.listdir
+  - Added CLI starting helpers
+  - Added unit conversion module
+V 0.3.0:
+  - Added listdir function
+  - Added unit tests
+  - Uses docker for CI
+V 0.2.0:
+  - Reboot of the project
+  - Added cryptographic functions
+V 0.1.8:
+  - Added SQLite 3 Database existence checker
+V 0.1.7:
+  - Fixed python 2 distribution
+V 0.1.6:
+  - Added support for separate python 2 / 3 distributions
+V 0.1.5:
+  - Added interactive CLI template class
+  - Added methods to ensure files/directories exist
+V 0.1.1:
+  - Fixed setuptools configuration
+V 0.1.0:
+  - Implemented basic file operation methods
+  - Implemented byte string converter
+  - Initial project structure
