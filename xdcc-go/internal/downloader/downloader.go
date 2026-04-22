@@ -19,7 +19,7 @@ type Options struct {
 	WaitTime         int
 	Username         string
 	ChannelJoinDelay int
-	Verbose          bool
+	Verbosity        int // 0=normal, 1=verbose (-v), 2=debug (-vv), -1=quiet
 }
 
 // DownloadPacks downloads a list of XDCC packs sequentially.
@@ -46,7 +46,7 @@ func downloadPack(pack *entities.XDCCPack, opts Options, retryCount int) {
 		ChannelJoinDelay: opts.ChannelJoinDelay,
 	}
 
-	client := xdccirc.NewClient(pack, ircOpts, opts.Verbose)
+	client := xdccirc.NewClient(pack, ircOpts, opts.Verbosity)
 	_, err := client.Download()
 	if err == nil {
 		return

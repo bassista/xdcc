@@ -25,7 +25,7 @@ func main() {
 		waitTime         int
 		username         string
 		channelJoinDelay int
-		verbose          bool
+		verbosity        int
 		quiet            bool
 	)
 
@@ -86,13 +86,13 @@ menu, and then downloads the chosen pack(s).`,
 				WaitTime:         waitTime,
 				Username:         username,
 				ChannelJoinDelay: channelJoinDelay,
-				Verbose:          verbose && !quiet,
+				Verbosity:        verbosityLevel(verbosity, quiet),
 			})
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&engineName, "search-engine", "nibl",
+	cmd.Flags().StringVar(&engineName, "search-engine", "xdcc-eu",
 		"Search engine to use (nibl, xdcc-eu, ixirc, subsplease)")
 	cmd.Flags().StringVarP(&server, "server", "s", "irc.rizon.net",
 		"IRC server (overridden by search result if different)")
@@ -112,13 +112,21 @@ menu, and then downloads the chosen pack(s).`,
 		"IRC nickname to use (random if not set)")
 	cmd.Flags().IntVar(&channelJoinDelay, "channel-join-delay", -1,
 		"Seconds to wait after connecting (-1 = random 5-10s)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
+	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Verbose output (-v=verbose, -vv=debug)")
 	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Quiet mode")
 	_ = server
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// verbosityLevel converts count+quiet flags to verbosity int.
+func verbosityLevel(count int, quiet bool) int {
+	if quiet {
+		return -1
+	}
+	return count
 }
 
 // selectPacks prompts the user to select one or more packs from the results list.

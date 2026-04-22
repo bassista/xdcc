@@ -20,7 +20,7 @@ func main() {
 		waitTime         int
 		username         string
 		channelJoinDelay int
-		verbose          bool
+		verbosity        int
 		quiet            bool
 	)
 
@@ -57,7 +57,7 @@ Supports ranges (#1-10), steps (#1-10;2), and comma lists (#1,2,3).`,
 				WaitTime:         waitTime,
 				Username:         username,
 				ChannelJoinDelay: channelJoinDelay,
-				Verbose:          verbose && !quiet,
+				Verbosity:        verbosityLevel(verbosity, quiet),
 			})
 			return nil
 		},
@@ -81,10 +81,19 @@ Supports ranges (#1-10), steps (#1-10;2), and comma lists (#1,2,3).`,
 		"IRC nickname to use (random if not set)")
 	cmd.Flags().IntVar(&channelJoinDelay, "channel-join-delay", -1,
 		"Seconds to wait after connecting before joining channels (-1 = random 5-10s)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Quiet mode (suppress verbose)")
+	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Verbose output (-v=verbose, -vv=debug)")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Quiet mode (suppress all output)")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// verbosityLevel converts count+quiet flags to verbosity int.
+// quiet => -1, default => 0, -v => 1, -vv => 2
+func verbosityLevel(count int, quiet bool) int {
+	if quiet {
+		return -1
+	}
+	return count
 }
