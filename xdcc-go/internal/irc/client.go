@@ -437,7 +437,7 @@ func (c *Client) handleDCCSend(client *girc.Client, parts []string, sourceHost s
 		// Request resume
 		c.progress = pos
 		resumeParam := fmt.Sprintf("\"%s\" %s %d", filename, port, pos)
-		c.infof("Resuming download from %s / %s", entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
+		c.debugf("Resuming download from %s / %s", entities.HumanReadableBytes(pos), entities.HumanReadableBytes(filesize))
 		c.logf("Sending DCC RESUME: %s", resumeParam)
 		// Send CTCP DCC RESUME to the bot
 		client.Cmd.SendCTCP(c.pack.Bot, "DCC", "RESUME "+resumeParam)

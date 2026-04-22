@@ -11,22 +11,34 @@ import (
 )
 
 func main() {
-	var engineName string
-	var verbose bool
+	var (
+		engineName string
+		verbosity  int
+	)
 
 	cmd := &cobra.Command{
-		Use:   "xdcc-search <search_term> <engine>",
-		Short: "Search for XDCC packs",
-		Long: `xdcc-search searches for XDCC packs using the specified search engine
-and prints the results with the corresponding download commands.
+		Use:   "xdcc-search <search_term> [engine]",
+		Short: "Search for XDCC packs and print download commands",
+		Long: `xdcc-search queries an XDCC search engine and prints one result per line
+with the corresponding xdcc-dl command ready to copy-paste.
 
-Available engines: ` + strings.Join(search.AvailableEngines(), ", "),
-		Args: cobra.ExactArgs(2),
+The engine argument is optional; default is xdcc-eu.
+Available engines: ` + strings.Join(search.AvailableEngines(), ", ") + `
+
+Output format per result:
+  <filename> [<size>] (xdcc-dl "<message>" [--server <host>])
+
+Verbosity levels:
+  (default)  results only
+  -v         also show search engine debug info (e.g. HTTP requests)`,
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			term := args[0]
-			engineName = args[1]
+			if len(args) == 2 {
+				engineName = args[1]
+			}
 
-			engine := search.EngineByName(engineName, verbose)
+			engine := search.EngineByName(engineName, verbosity >= 1)
 			if engine == nil {
 				return fmt.Errorf("unknown search engine %q. Available: %s",
 					engineName, strings.Join(search.AvailableEngines(), ", "))
@@ -61,9 +73,10 @@ Available engines: ` + strings.Join(search.AvailableEngines(), ", "),
 		},
 	}
 
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose/debug output")
+	cmd.Flags().StringVar(&engineName, "search-engine", "xdcc-eu",
+		"Search engine to use: nibl, xdcc-eu, ixirc, subsplease (default: xdcc-eu). Can also be passed as second positional argument")
+	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v shows search engine debug info")
 
-	_ = engineName
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}

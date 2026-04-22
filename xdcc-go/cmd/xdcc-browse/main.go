@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -27,13 +28,31 @@ func main() {
 		channelJoinDelay int
 		verbosity        int
 		quiet            bool
+		extFilter        string
+		botFilter        string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "xdcc-browse <search_term>",
 		Short: "Search for XDCC packs and download interactively",
-		Long: `xdcc-browse searches for XDCC packs, displays an interactive selection
-menu, and then downloads the chosen pack(s).`,
+		Long: `xdcc-browse searches for XDCC packs, optionally filters the results,
+displays a numbered list, and then downloads the selected pack(s).
+
+Filters (applied before the selection menu):
+  --ext   keep only files with the given extension(s)  (e.g. --ext=mkv,avi)
+  --bot   keep only packs from bots whose name contains the given substring
+
+Selection syntax (after the list is shown):
+  3        single pack
+  1-5      range (packs 1 through 5)
+  1,3,7    comma-separated list
+  all      download everything in the list
+
+Verbosity levels:
+  (default)  show connection and download progress
+  -v         also show bot notices, channel joins, WHOIS results
+  -vv        full debug (DNS, DCC internals, all IRC events)
+  -q         suppress all output`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			term := args[0]
@@ -48,6 +67,17 @@ menu, and then downloads the chosen pack(s).`,
 			if err != nil {
 				return fmt.Errorf("search failed: %w", err)
 			}
+
+			// Filter by extension if requested
+			if extFilter != "" {
+				results = filterByExtension(results, extFilter)
+			}
+
+			// Filter by bot name if requested
+			if botFilter != "" {
+				results = filterByBot(results, botFilter)
+			}
+
 			if len(results) == 0 {
 				fmt.Println("No results found.")
 				return nil
@@ -56,9 +86,10 @@ menu, and then downloads the chosen pack(s).`,
 			// Display results
 			fmt.Printf("\nFound %d result(s):\n\n", len(results))
 			for i, pack := range results {
-				fmt.Printf("  [%3d] %s [%s]\n", i+1,
+				fmt.Printf("  [%3d] %s [%s] bot: %s\n", i+1,
 					pack.Filename,
-					entities.HumanReadableBytes(pack.Size))
+					entities.HumanReadableBytes(pack.Size),
+					pack.Bot)
 			}
 
 			// Interactive selection
@@ -72,6 +103,14 @@ menu, and then downloads the chosen pack(s).`,
 			}
 
 			entities.PreparePacks(selected, out)
+
+			// If --server was explicitly set, override the server on all selected packs
+			if server != "" {
+				srv := entities.ParseIrcServer(server)
+				for _, p := range selected {
+					p.Server = srv
+				}
+			}
 
 			throttleBytes, err := entities.ParseThrottle(throttle)
 			if err != nil {
@@ -93,32 +132,68 @@ menu, and then downloads the chosen pack(s).`,
 	}
 
 	cmd.Flags().StringVar(&engineName, "search-engine", "xdcc-eu",
-		"Search engine to use (nibl, xdcc-eu, ixirc, subsplease)")
-	cmd.Flags().StringVarP(&server, "server", "s", "irc.rizon.net",
-		"IRC server (overridden by search result if different)")
+		"Search engine to use: nibl, xdcc-eu, ixirc, subsplease (default: xdcc-eu)")
+	cmd.Flags().StringVarP(&server, "server", "s", "",
+		"Override IRC server for all selected packs (host or host:port). Default: use server from search result")
 	cmd.Flags().StringVarP(&out, "out", "o", "",
-		"Output file path (defaults to pack filename)")
+		"Output directory or file path (defaults to current directory with pack filename)")
 	cmd.Flags().StringVarP(&throttle, "throttle", "t", "-1",
-		"Download speed limit (e.g. 50M, 100K). -1 = unlimited")
+		"Download speed limit in bytes/s (e.g. 512K, 2M, 1G). -1 = unlimited")
 	cmd.Flags().IntVar(&connectTimeout, "connect-timeout", 120,
-		"Seconds to wait for the bot to initiate DCC (before transfer starts)")
+		"Seconds to wait for the bot to initiate the DCC transfer (default: 120)")
 	cmd.Flags().IntVar(&stallTimeout, "stall-timeout", 60,
-		"Seconds of no transfer progress before aborting (0 = disabled)")
+		"Seconds of no transfer progress before aborting. 0 = disabled (default: 60)")
 	cmd.Flags().StringVar(&fallbackChannel, "fallback-channel", "",
-		"IRC channel to join if WHOIS finds none")
+		"IRC channel to join if WHOIS returns no channels for the bot")
 	cmd.Flags().IntVar(&waitTime, "wait-time", 0,
-		"Seconds to wait before sending the XDCC request")
+		"Extra seconds to wait before sending the XDCC request (default: 0)")
 	cmd.Flags().StringVar(&username, "username", "",
-		"IRC nickname to use (random if not set)")
+		"IRC nickname to use. A random suffix is appended automatically. Default: random")
 	cmd.Flags().IntVar(&channelJoinDelay, "channel-join-delay", -1,
-		"Seconds to wait after connecting (-1 = random 5-10s)")
-	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Verbose output (-v=verbose, -vv=debug)")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Quiet mode")
-	_ = server
+		"Seconds to wait after connecting before sending WHOIS. -1 = random 5-10s (default: -1)")
+	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v shows bot notices, -vv shows full debug info")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress all output including progress")
+	cmd.Flags().StringVar(&extFilter, "ext", "",
+		"Filter results by file extension(s), comma-separated (e.g. --ext=mkv,avi,mp4)")
+	cmd.Flags().StringVar(&botFilter, "bot", "",
+		"Filter results by bot name substring, case-insensitive (e.g. --bot=WOND)")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// filterByBot returns only packs whose bot name contains the given substring (case-insensitive).
+func filterByBot(packs []*entities.XDCCPack, substr string) []*entities.XDCCPack {
+	sub := strings.ToLower(substr)
+	var out []*entities.XDCCPack
+	for _, p := range packs {
+		if strings.Contains(strings.ToLower(p.Bot), sub) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+// extList is a comma-separated string like "mkv,avi,mp4".
+func filterByExtension(packs []*entities.XDCCPack, extList string) []*entities.XDCCPack {
+	exts := make(map[string]bool)
+	for _, e := range strings.Split(extList, ",") {
+		e = strings.TrimSpace(strings.ToLower(e))
+		if e != "" {
+			if !strings.HasPrefix(e, ".") {
+				e = "." + e
+			}
+			exts[e] = true
+		}
+	}
+	var out []*entities.XDCCPack
+	for _, p := range packs {
+		ext := strings.ToLower(filepath.Ext(p.Filename))
+		if exts[ext] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // verbosityLevel converts count+quiet flags to verbosity int.

@@ -28,8 +28,22 @@ func main() {
 		Use:   "xdcc-dl <message>",
 		Short: "Download a file via XDCC IRC protocol",
 		Long: `xdcc-dl downloads files from IRC bots using the XDCC protocol.
-The message should be in the format: /msg <bot> xdcc send #<pack>
-Supports ranges (#1-10), steps (#1-10;2), and comma lists (#1,2,3).`,
+
+The message must be in the format:  /msg <bot> xdcc send #<pack>
+Pack number supports ranges, steps, and comma lists:
+  /msg MyBot xdcc send #5        single pack
+  /msg MyBot xdcc send #1-10     packs 1 through 10
+  /msg MyBot xdcc send #1-10;2   packs 1,3,5,7,9 (every 2nd)
+  /msg MyBot xdcc send #1,3,7    specific packs
+
+The IRC server is detected automatically from the bot name prefix when
+possible. Use --server to override with an explicit address.
+
+Verbosity levels:
+  (default)  show connection and download progress
+  -v         also show bot notices, channel joins, WHOIS results
+  -vv        full debug (DNS, DCC internals, all IRC events)
+  -q         suppress all output`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			message := args[0]
@@ -64,25 +78,25 @@ Supports ranges (#1-10), steps (#1-10;2), and comma lists (#1,2,3).`,
 	}
 
 	cmd.Flags().StringVarP(&server, "server", "s", "irc.rizon.net",
-		"IRC server address")
+		"IRC server address (host or host:port). Overrides automatic server detection from bot name")
 	cmd.Flags().StringVarP(&out, "out", "o", "",
-		"Output file path (defaults to pack filename)")
+		"Output directory or file path (defaults to current directory with pack filename)")
 	cmd.Flags().StringVarP(&throttle, "throttle", "t", "-1",
-		"Download speed limit (e.g. 50M, 100K, 1G). -1 = unlimited")
+		"Download speed limit in bytes/s (e.g. 512K, 2M, 1G). -1 = unlimited")
 	cmd.Flags().IntVar(&connectTimeout, "connect-timeout", 120,
-		"Seconds to wait for the bot to initiate DCC (before the transfer starts)")
+		"Seconds to wait for the bot to initiate the DCC transfer (default: 120)")
 	cmd.Flags().IntVar(&stallTimeout, "stall-timeout", 60,
-		"Seconds of no transfer progress before aborting (0 = disabled)")
+		"Seconds of no transfer progress before aborting. 0 = disabled (default: 60)")
 	cmd.Flags().StringVar(&fallbackChannel, "fallback-channel", "",
-		"IRC channel to join if WHOIS finds none")
+		"IRC channel to join if WHOIS returns no channels for the bot")
 	cmd.Flags().IntVar(&waitTime, "wait-time", 0,
-		"Seconds to wait before sending the XDCC request")
+		"Extra seconds to wait before sending the XDCC request (default: 0)")
 	cmd.Flags().StringVar(&username, "username", "",
-		"IRC nickname to use (random if not set)")
+		"IRC nickname to use. A random suffix is appended automatically. Default: random")
 	cmd.Flags().IntVar(&channelJoinDelay, "channel-join-delay", -1,
-		"Seconds to wait after connecting before joining channels (-1 = random 5-10s)")
-	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Verbose output (-v=verbose, -vv=debug)")
-	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Quiet mode (suppress all output)")
+		"Seconds to wait after connecting before sending WHOIS. -1 = random 5-10s (default: -1)")
+	cmd.Flags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v shows bot notices, -vv shows full debug info")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "Suppress all output including progress")
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
