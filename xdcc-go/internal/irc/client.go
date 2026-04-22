@@ -169,6 +169,10 @@ func (c *Client) DownloadAll() []PackResult {
 	}
 
 	for i := range c.packs {
+		if i > 0 {
+			c.debugf("Waiting 3s before next pack")
+			time.Sleep(3 * time.Second)
+		}
 		results[i] = c.downloadPackAtIndex(i, 0)
 		// Fatal errors: propagate to all remaining packs
 		if results[i].Error != nil {
